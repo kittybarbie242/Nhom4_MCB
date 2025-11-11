@@ -1,0 +1,146 @@
+#include <Wire.h>
+#include "MAX30105.h"
+#include "heartRate.h"
+#include <Adafruit_MLX90614.h>
+#include <BLEDevice.h>
+#include <BLEUtils.h>
+#include <BLEServer.h>
+#include <BLE2902.h>
+
+// BLE UUIDs 
+#define SERVICE_UUID        "4fafc201-1fb5-459e-8fcc-c5c9c331914b"
+#define CHARACTERISTIC_UUID "beb5483e-36e1-4688-b7f5-ea07361b26a8"
+
+// Two hardware I2C buses on ESP32 
+TwoWire I2C_SPO2 = TwoWire(0);   // MAX30102 -> SDA=21, SCL=22
+TwoWire I2C_TEMP = TwoWire(1);   // MLX90614 -> SDA=19, SCL=18
+
+// Sensors
+MAX30105 particleSensor;
+Adafruit_MLX90614 mlx = Adafruit_MLX90614();
+
+// BLE 
+bool deviceConnected = false;
+BLECharacteristic *pCharacteristic;
+
+// Variables
+float tempC = 0;
+float bpm = 0, spo2 = 0;
+
+// BLE Callbacks
+class MyServerCallbacks : public BLEServerCallbacks {
+  void onConnect(BLEServer *pServer) override {
+    deviceConnected = true;
+    Serial.println("BLE Central connected");
+  }
+  void onDisconnect(BLEServer *pServer) override {
+    deviceConnected = false;
+    Serial.println("BLE Central disconnected");
+    pServer->getAdvertising()->start();
+  }
+};
+
+void setup() {
+  Serial.begin(115200);
+  delay(200);
+
+  // Init I2C buses
+  I2C_SPO2.begin(21, 22, 400000);  // MAX30102: fast mode
+  I2C_TEMP.begin(19, 18, 100000);  // MLX90614: safe mode
+
+  // MLX90614 init
+  if (!mlx.begin(0x5A, &I2C_TEMP)) {
+    Serial.println("MLX90614 not found!");
+    while (1) delay(10);
+  }
+  Serial.println("MLX90614 ready");
+
+  //MAX30102 init 
+  if (!particleSensor.begin(I2C_SPO2, I2C_SPEED_STANDARD)) {
+    Serial.println("MAX30102 not found!");
+    while(1) delay(10);
+  }
+  particleSensor.setup();
+  particleSensor.setPulseAmplitudeRed(0x0A);
+  particleSensor.setPulseAmplitudeIR(0x0A);
+  particleSensor.setPulseAmplitudeGreen(0);
+  Serial.println("MAX30102 ready");
+
+  // BLE setup
+  BLEDevice::init("ESP32_HealthMonitor");
+  BLEServer *pServer = BLEDevice::createServer();
+  pServer->setCallbacks(new MyServerCallbacks());
+  BLEService *pService = pServer->createService(SERVICE_UUID);
+  pCharacteristic = pService->createCharacteristic(
+      CHARACTERISTIC_UUID,
+      BLECharacteristic::PROPERTY_NOTIFY | BLECharacteristic::PROPERTY_READ);
+  pCharacteristic->addDescriptor(new BLE2902());
+  pService->start();
+  BLEAdvertising *pAdvertising = BLEDevice::getAdvertising();
+  pAdvertising->addServiceUUID(SERVICE_UUID);
+  BLEDevice::startAdvertising();
+  Serial.println("BLE advertising started!");
+}
+
+void loop() {
+  //Read Temperature
+  static uint32_t tLastTemp = 0;
+  if (millis() - tLastTemp >= 1000) {
+    tLastTemp = millis();
+    tempC = mlx.readObjectTempC();
+  }
+
+  // Read MAX30102 
+  long ir = particleSensor.getIR();
+  bool fingerOn = (ir > 8000); // Kiem tra co ngon tay cham vao khong
+  static uint32_t lastBeatMs = 0;
+  
+  // Cac bien tinh trung bình BPM
+  static int beatBuf[10] = {0};
+  static uint8_t beatIdx = 0;
+  static int beatAvg = 0;
+
+  if (fingerOn && checkForBeat(ir)) {  // Neu co ngon tay va co nhip
+    uint32_t now = millis();
+    uint32_t delta = now - lastBeatMs;
+    lastBeatMs = now;
+    float bpmInst = 60.0f / (delta / 1000.0f); // BPM tuc thoi
+    
+    if (bpmInst > 40 && bpmInst < 180) { // Loc nhieu 
+      beatBuf[beatIdx] = (int)bpmInst;
+      beatIdx = (beatIdx + 1) % 10;
+      
+      // Tnh trung binh 10 mau gan nhat
+      int sum = 0; for (int i = 0; i < 10; i++) sum += beatBuf[i];
+      beatAvg = sum / 10;
+    }
+  }
+  
+  bpm = fingerOn ? beatAvg : 0; // Neu khong c ngon tay, BPM = 0
+
+  // Uoc luong SpO₂
+  float spo2Est = map((long)ir, 20000, 100000, 90, 99);
+  spo2 = fingerOn ? constrain(spo2Est, 90, 99) : 0; // Neu khong co ngon tay, SpO2 = 0
+
+  // --- Hien thi Serial (moi 1 giay) ---
+  static uint32_t tLastDbg = 0;
+  if (millis() - tLastDbg >= 1000) {
+    tLastDbg = millis();
+    Serial.printf("bpm=%d  spo2=%.1f  temp=%.1f\n", (int)bpm, spo2, tempC);
+  }
+
+  // Gui qua BLE
+  
+
+  char buf[64];
+  snprintf(buf, sizeof(buf),
+           "%.1f,%.1f,%.1f",
+           bpm, spo2, tempC);
+
+  if (deviceConnected) {
+    pCharacteristic->setValue((uint8_t*)buf, strlen(buf));
+    pCharacteristic->notify();
+  }
+
+  delay(20); 
+}
